@@ -49,7 +49,7 @@ func (c *Client) FetchAccountProfile(a *auth.Auth) (string, error) {
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return "", err
 	}

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/egress"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
@@ -36,6 +37,7 @@ import (
 
 // Config 面板依赖（main 装配注入）。
 type Config struct {
+	Egress    *egress.Manager
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
@@ -81,10 +83,11 @@ type Config struct {
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
 // 本 mux 的 pattern 均带 /panel 前缀（外层不做前缀剥离）。
 type Panel struct {
-	cfg     Config
-	mux     *http.ServeMux
-	started time.Time
-	logs    *Ring
+	proxyMutationMu sync.Mutex
+	cfg             Config
+	mux             *http.ServeMux
+	started         time.Time
+	logs            *Ring
 
 	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
@@ -219,6 +222,15 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("GET /panel/api/proxies", p.withAuth(p.proxiesList))
+	p.mux.HandleFunc("POST /panel/api/proxies/settings", p.withAuth(p.proxiesSettings))
+	p.mux.HandleFunc("POST /panel/api/proxies/import", p.withAuth(p.proxiesImport))
+	p.mux.HandleFunc("POST /panel/api/proxies/generate", p.withAuth(p.proxiesGenerate))
+	p.mux.HandleFunc("POST /panel/api/proxies/check", p.withAuth(p.proxiesCheck))
+	p.mux.HandleFunc("POST /panel/api/proxies/assign", p.withAuth(p.proxiesAssign))
+	p.mux.HandleFunc("POST /panel/api/proxies/{id}/update", p.withAuth(p.proxyUpdate))
+	p.mux.HandleFunc("POST /panel/api/proxies/{id}/remove", p.withAuth(p.proxyRemove))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/proxy", p.withAuth(p.accountProxy))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -278,6 +290,14 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"expiring_soon_sec": int64(p.expiringSoonWindow().Seconds()),
 		"accounts":          p.cfg.Pool.List(),
 		"model_locks":       p.cfg.Pool.ModelLockView(),
+	}
+	if p.cfg.Egress != nil {
+		routes := map[string]egress.Route{}
+		for _, a := range p.cfg.Pool.List() {
+			routes[a.UID] = p.cfg.Egress.Route(a.UID)
+		}
+		out["account_egress"] = routes
+		out["proxy_enabled"] = p.cfg.Egress.Enabled()
 	}
 	// today 今日（本地日历日零点起）的用量合计：credit 是上游真实扣费加和
 	// （usage 桶级 Cr），前端拿它对照「日均需耗」判断今天是否消耗到位。

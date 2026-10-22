@@ -311,7 +311,7 @@ func (c *Client) claimViaWeb(a *auth.Auth, taskCode string) (credit, energy int6
 		req.Header.Set("X-Domain", d)
 	}
 
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return 0, 0, err
 	}

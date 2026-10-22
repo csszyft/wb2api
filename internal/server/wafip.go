@@ -35,9 +35,27 @@ const wafIPThreshold = 2
 
 // wafIPGate WAF IP 级拦截状态机（Handler 内嵌，零值可用）。
 type wafIPGate struct {
-	mu    sync.Mutex
-	hits  map[string]time.Time // uid → 最近一次 WAF 403 时刻（判定窗内，惰性剪枝）
-	until time.Time            // IP 级拦截激活截止；零值 = 未激活
+	mu     sync.Mutex
+	hits   map[string]time.Time // uid → 最近一次 WAF 403 时刻（判定窗内，惰性剪枝）
+	until  time.Time            // IP 级拦截激活截止；零值 = 未激活
+	routes map[string]*wafIPGate
+}
+
+// Each detected exit IP gets its own gate. Different proxy credentials with
+// the same exit share the gate; an error on one exit cannot stop another exit.
+func (g *wafIPGate) forRoute(key string) *wafIPGate {
+	if key == "" || key == "direct" {
+		return g
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.routes == nil {
+		g.routes = make(map[string]*wafIPGate)
+	}
+	if g.routes[key] == nil {
+		g.routes[key] = &wafIPGate{}
+	}
+	return g.routes[key]
 }
 
 // noteWaf 记一次某账号的 WAF 403，返回记账后 IP 级拦截是否激活（调用方据此

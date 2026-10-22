@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/egress"
 )
 
 // reportPath 活跃上报通道（实测）。
@@ -38,7 +39,7 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 		return nil, err
 	}
 	c.BillingHeaders(req, a)
-	return c.doJSON(req)
+	return c.doJSON(req, a)
 }
 
 // billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / daily-checkin）
@@ -71,6 +72,10 @@ var billingRetryDelay = 2 * time.Second
 // 已签到/参数错、4xx、限流）不重试——重试只会原样再失败一次。
 func isTransientBillingErr(err error) bool {
 	if err == nil {
+		return false
+	}
+	var proxyErr *egress.RequestError
+	if errors.As(err, &proxyErr) {
 		return false
 	}
 	var ue *Error

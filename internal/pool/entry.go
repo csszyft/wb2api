@@ -146,11 +146,12 @@ type modelCooldown struct {
 	Hits int
 }
 type entry struct {
-	dailyTokenLimits map[string]int64
-	dailyModelTokens map[string]DailyModelTokens
-	a                *auth.Auth
-	credits          int64
-	creditsTotal     int64 // 积分总额度（UserResource 聚合；0 = 未知）
+	outboundAvailable func(string) bool
+	dailyTokenLimits  map[string]int64
+	dailyModelTokens  map[string]DailyModelTokens
+	a                 *auth.Auth
+	credits           int64
+	creditsTotal      int64 // 积分总额度（UserResource 聚合；0 = 未知）
 	// creditsExpiring 即将过期（签到时按 expiring_soon 窗口判定）的可用积分子集，
 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废。
@@ -316,6 +317,9 @@ func (e *entry) hardCooldownSet() bool {
 // 临时停用（manualDisabled）与永久禁用同判：对「能不能被选中」这个问题二者等价，
 // 区别只在**怎么解**（ClearManualDisabled vs Revive/ReviveDisabled）与面板呈现。
 func (e *entry) healthy(now time.Time) bool {
+	if e.outboundAvailable != nil && !e.outboundAvailable(e.a.UID) {
+		return false
+	}
 	if e.disabled || e.manualDisabled {
 		return false
 	}
@@ -352,6 +356,7 @@ func (e *entry) healthy(now time.Time) bool {
 // （degradeUntil 过期即 healthy=true），不产生假阴性。
 func (e *entry) modelExempt() bool {
 	return len(e.modelCooldowns) > 0 &&
+		(e.outboundAvailable == nil || e.outboundAvailable(e.a.UID)) &&
 		!e.disabled && !e.manualDisabled && e.until.IsZero() &&
 		e.breakerUntil.IsZero() && e.degradeUntil.IsZero()
 }

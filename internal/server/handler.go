@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/egress"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
@@ -895,6 +896,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	sgEligible := h.loadLive().DeepseekSGFallback && h.cfg.GlobalEnabled && realm == "global" && bareModel == pool.DeepseekFreeModel
 	paidFallback := false
 	cnFallback := false
+	var lastEgressKey string
+	currentWafGate := func() *wafIPGate { return h.wafIP.forRoute(lastEgressKey) }
+	wafStopsAll := func() bool {
+		return (h.cfg.Upstream.Egress == nil || !h.cfg.Upstream.Egress.Enabled()) && currentWafGate().active()
+	}
 	// This specific model chain may use paid CN 4.1 after SG. Keep explicit
 	// prefixes fixed, and do not apply this exception to other catalog groups.
 	cnFallbackAllowed := sgEligible && !realmExplicit && h.cfg.Pool.HasRealm("cn")
@@ -903,13 +909,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		realmRestricted = true
 	}
 	freeExhausted := func() bool {
-		if !sgEligible || paidFallback || cnFallback || r.Context().Err() != nil || h.wafIP.active() {
+		if !sgEligible || paidFallback || cnFallback || r.Context().Err() != nil || wafStopsAll() {
 			return false
 		}
 		return h.cfg.Pool.DeepseekFreeExhausted()
 	}
 	cnFallbackPending := func() bool {
-		return cnFallbackAllowed && paidFallback && !cnFallback && r.Context().Err() == nil && !h.wafIP.active() && h.cfg.Pool.DeepseekCNFallbackReady()
+		return cnFallbackAllowed && paidFallback && !cnFallback && r.Context().Err() == nil && !wafStopsAll() && h.cfg.Pool.DeepseekCNFallbackReady()
 	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
@@ -1175,7 +1181,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Re-enter it at most once; each phase still gets a bounded rotation budget.
 	cheaperRecoveryUsed := false
 	recoverCheaperPhase := func() bool {
-		if cheaperRecoveryUsed || wt.wrote() || !sgEligible || (!paidFallback && !cnFallback) || r.Context().Err() != nil || h.wafIP.active() {
+		if cheaperRecoveryUsed || wt.wrote() || !sgEligible || (!paidFallback && !cnFallback) || r.Context().Err() != nil || wafStopsAll() {
 			return false
 		}
 		if !h.cfg.Pool.DeepseekFreeExhausted() {
@@ -1202,7 +1208,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return true
 	}
 	retryModelBusy := func() bool {
-		if busyWaited || wt.wrote() || ptlRetryUID != "" || !busySource() || r.Context().Err() != nil || h.wafIP.active() {
+		if busyWaited || wt.wrote() || ptlRetryUID != "" || !busySource() || r.Context().Err() != nil || wafStopsAll() {
 			return false
 		}
 		wait, ok := h.cfg.Pool.ModelBusyExhausted(bareModel, busyScope(), paidFallback || cnFallback)
@@ -1327,6 +1333,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = http.StatusServiceUnavailable
 			break
 		}
+		lastEgressKey = h.cfg.Upstream.Egress.Route(acct.UID).Key
 		st.uid = acct.UID
 		// 同步昵称：流水行只写 uid8 时无法直观看是哪个号，昵称随本次选号带入日志行
 		// （昵称认人、uid8 供 grep，见 logfmt.Label）。轮转换号时随之覆盖为最终成功号。
@@ -1352,6 +1359,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
 				lastErr = err
+				var proxyErr *egress.RequestError
+				if errors.As(err, &proxyErr) {
+					lastErr = proxyErr
+					fail(acct.UID)
+					if r.Context().Err() != nil {
+						break
+					}
+					continue
+				}
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 					// 12153 口径统一（本批）：走阈值版 NoteSessionDead，与
@@ -1396,6 +1412,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = uerr.Status
 		}
 		if uerr == nil && terr != nil {
+			var proxyErr *egress.RequestError
+			if errors.As(terr, &proxyErr) {
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptObs{Stream: peek.Stream}, attemptStarted)
+				lastErr = proxyErr
+				fail(acct.UID)
+				if r.Context().Err() != nil {
+					break
+				}
+				continue
+			}
 			// 上游超时 / 停滞：**不换号、不罚号**（吸收上游 PR #93 的 isUpstreamTimeout）。
 			//
 			// 超时不是账号的问题：同一份请求换到别的号，撞上的是同一个慢上游，只会把
@@ -1650,8 +1676,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 则立即终止轮转——继续换号只会把请求放大 MaxRotate 倍打同一出口 IP，
 			// 加重风控。账号级软冷却已在上方 applyErrorPolicy 照常记账（单号偶发 403
 			// 仍冷却），IP 级状态只改变「是否继续轮转」——协同不叠加。
-			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
-				break
+			if kind == upstream.ErrWafBlock && currentWafGate().noteWaf(acct.UID) {
+				if h.cfg.Upstream.Egress != nil && h.cfg.Upstream.Egress.Enabled() {
+					h.cfg.Upstream.Egress.Block(lastEgressKey, time.Now().Add(wafIPWindow))
+				} else {
+					break
+				}
 			}
 			// 11133 跨账号确定性收敛：同一请求在两个不同账号上拿到**同一业务码**
 			// （ErrFingerprint 取 code，requestId 不参与比对）→ 参数拒绝是请求级
@@ -1829,6 +1859,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		msg += ": " + lastErr.Error()
 	}
 	code := "no_healthy_account"
+	var proxyErr *egress.RequestError
+	if errors.As(lastErr, &proxyErr) {
+		code, msg = proxyErr.Code, proxyErr.Message
+	}
 	// 上游超时：轮转已在传输层分支止损（见 isUpstreamTimeout），这里给一条**能区分**
 	// 的文案，别混进「没有可用账号」——两者的排查方向完全不同（超时看上游/链路，
 	// 无号看池子）。
@@ -1841,6 +1875,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// （无上游原文）固定 no_healthy_account hint。上游错误若属未覆盖形态，
 	// hintOf 返回空串 → 响应不带 gateway_hint 字段（不编造）。
 	hint := upstream.NoHealthyAccountHint()
+	proxyTerminal := proxyErr != nil
+	if proxyTerminal {
+		hint = "proxy route unavailable; check the account binding and proxy connectivity"
+	}
 	// WAF IP 级拦截措辞（fail-fast 终止路径）：轮转已止损（继续换号只会打同一出口
 	// IP，加重风控），业务 code 换成 waf_ip_blocked 让客户端识别「换号无用、等窗口」。
 	// 透传语义（原文优先）：有上游 body 时 message 装原文（排障必需，不拼接本地
@@ -1877,7 +1915,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				msg = ue.Msg
 			}
 		}
-		if ue.Kind == upstream.ErrWafBlock && h.wafIP.active() {
+		if ue.Kind == upstream.ErrWafBlock && currentWafGate().active() {
 			wafTerminal = true
 			code = "waf_ip_blocked"
 			if s := strings.TrimSpace(ue.Msg); s != "" {
@@ -1885,6 +1923,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else {
 				msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
 			}
+		}
+	}
+	if h.cfg.Upstream.Egress != nil && h.cfg.Upstream.Egress.Enabled() && lastErr == nil {
+		checked, allBlocked := false, true
+		for _, account := range h.cfg.Pool.List() {
+			if account.Disabled || account.ManualDisabled || (realmRestricted && account.Realm != realm) {
+				continue
+			}
+			checked = true
+			if h.cfg.Upstream.Egress.Available(account.UID) {
+				allBlocked = false
+				break
+			}
+		}
+		if checked && allBlocked {
+			proxyTerminal = true
+			code, msg = "proxy_unavailable", "eligible accounts have no available proxy route; bind or check their exit IPs"
+			hint = "proxy route unavailable; check the account binding and proxy connectivity"
 		}
 	}
 	// 末端 429 + Retry-After（上游 da22a92 语义，本 fork 收窄实现）：轮转耗尽且池内
@@ -1905,7 +1961,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusBadRequest
 	}
 	retryAfter := 0
-	if !wafTerminal && !paramsTerminal && h.cfg.Pool != nil {
+	if !wafTerminal && !paramsTerminal && !proxyTerminal && h.cfg.Pool != nil {
 		scope := realm
 		if !realmRestricted {
 			scope = "" // 裸名归属：回落允许跨域 → 判定范围是全池
@@ -1966,7 +2022,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// Model-level unavailability must not look like an empty pool. Keep 6004's
 	// existing 429/Retry-After contract; 11102 or mixed model locks return 400.
-	if !wafTerminal && !paramsTerminal && code != "model_busy" && status == http.StatusServiceUnavailable && h.cfg.Pool != nil {
+	if !wafTerminal && !paramsTerminal && !proxyTerminal && code != "model_busy" && status == http.StatusServiceUnavailable && h.cfg.Pool != nil {
 		scope := realm
 		if !realmRestricted {
 			scope = ""
@@ -1990,17 +2046,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if paidFallback && code != "model_busy" && lastErr == nil && status == http.StatusServiceUnavailable {
+	if paidFallback && !proxyTerminal && code != "model_busy" && lastErr == nil && status == http.StatusServiceUnavailable {
 		code = "paid_fallback_unavailable"
 		msg = "free global deepseek quota exhausted; no healthy SG account with known credits above pool.reserve_credits"
 		hint = "refresh account balances or wait for free quota recovery; reserve credits are enforced"
 	}
-	if cnFallback && code != "model_busy" && lastErr == nil && status == http.StatusServiceUnavailable {
+	if cnFallback && !proxyTerminal && code != "model_busy" && lastErr == nil && status == http.StatusServiceUnavailable {
 		code = "cn_fallback_unavailable"
 		msg = "international DeepSeek and SG unavailable; no healthy CN account with known credits above pool.reserve_credits"
 		hint = "refresh CN account balances or wait for quota recovery; CN DeepSeek consumes credits and reserve credits are enforced"
 	}
-	if !wafTerminal && h.cfg.Pool != nil {
+	if !wafTerminal && !proxyTerminal && h.cfg.Pool != nil {
 		scope := realm
 		if !realmRestricted {
 			scope = ""

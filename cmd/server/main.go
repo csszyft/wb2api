@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/egress"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -42,7 +43,7 @@ import (
 // 之所以用 var 而非 const：const 无法被 -ldflags -X 覆盖，版本号就得手改源码，
 // 于是很容易留下 `+dirty` / `+realmfix` 这类构建期后缀与源码里写死的字符串对不上。
 // 单一来源 = git tag，产物版本号永远可复现、无后缀。
-var appVersion = "v1.9.44"
+var appVersion = "v1.9.45"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -176,6 +177,22 @@ func main() {
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
+	proxyPool, err := egress.New(stateSibling(cfg.StateFile, "proxy-pool.json"))
+	if err != nil {
+		log.Fatalf("proxy pool: %v", err)
+	}
+	defer proxyPool.Close()
+	up.ConfigureEgress(proxyPool)
+	p.SetOutboundAvailable(proxyPool.Available)
+	p.SetAccountChangeHook(func(auths []*auth.Auth) {
+		accounts := make([]egress.Account, 0, len(auths))
+		for _, a := range auths {
+			accounts = append(accounts, egress.Account{UID: a.UID, Nickname: a.NicknameValue(), Realm: a.Realm()})
+		}
+		if err := proxyPool.SyncAccounts(accounts); err != nil {
+			log.Printf("proxy pool: account sync: %v", err)
+		}
+	})
 	// 脱敏两开关 + 历史推理裁剪档位经 Client 的 atomic setter 写入（面板保存配置会在
 	// 请求期并发热改，裸字段赋值是数据竞争）。此处为启动装配期，与请求路径无并发，
 	// 但走同一 API 保持唯一写入口。
@@ -332,6 +349,7 @@ func main() {
 		Usage:       rec,
 		RequestLog:  requestLog,
 		Upstream:    up,
+		Egress:      proxyPool,
 		Scheduler:   sch,
 		AuthDir:     cfg.AuthDir,
 		APIKey:      cfg.APIKey,

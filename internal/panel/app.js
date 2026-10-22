@@ -155,7 +155,7 @@ const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟�
 // 由 renderExpiry 顺带算出（与到期提醒逐行同口径）。null = 套餐信息还没拉到。
 let expDailyNeed = null;
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', proxies: '出口代理', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -166,6 +166,7 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
+  if (v === 'proxies') loadProxies();
   if (v === 'accounts' && lastPackages) renderExpiry(lastPackages);
   if (v === 'taskscenter') { loadSchoolStatus(true); reattachQueueView(); }
 }
@@ -451,12 +452,14 @@ function renderAccounts(list) {
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
+    const exit = overviewData && overviewData.account_egress && overviewData.account_egress[s.uid];
+    const exitLine = exit && overviewData.proxy_enabled ? '<div class="hint" style="font-size:11px;margin-top:3px" title="' + esc(exit.message || exit.proxy_name || '') + '">' + esc(exit.exit_ip ? '出口 ' + exit.exit_ip : exit.direct ? '原出口' : '未绑定出口') + (exit.available ? '' : ' <span class="tag warn">出口不可用</span>') + '</div>' : '';
     return '<tr class="' + cls + '" data-uid="' + esc(s.uid) + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       // 拖拽手柄：仅此单元格可起拖（见「账号拖拽排序」段）。draggable 由手柄的
       // mousedown 武装——直接给 tr 挂 draggable 会让选中文字/点按钮都变成拖拽。
       '<td class="drag-handle" title="按住拖动调整选号顺序">⠿</td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + exitLine + '</td>' +
       '<td>' + tag + ((s.daily_token_usage || []).some(q => q.limited) ? ' <span class="tag warn">每日 Token 已达限</span>' : '') + note + modelLimitTag(s.rate_limited_models, frozen) + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div>' + expTag + '</td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -1414,6 +1417,7 @@ $('importFile').onchange = async () => {
 $('btnAdd').onclick = openAdd;
 $('btnRefresh').onclick = async () => {
   const b = $('btnRefresh');
+  if (view === 'proxies') { await loadProxies(false); return; }
   b.disabled = true; b.textContent = '刷新中…';
   try {
     await api('balance_all', { method: 'POST' });
@@ -1429,6 +1433,7 @@ function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') reattachQueueView();
+  else if (view === 'proxies') loadProxies(true);
 }
 function start() {
   loadOverview(true);
@@ -3089,6 +3094,130 @@ async function downloadCredentials(path, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 30000);
   toast('凭证已导出，可直接重新导入；请妥善保存文件', 'ok');
 }
+
+/* ── 账号出口与代理池 ────────────────────────────────────────────── */
+let proxiesData = null, proxyFetching = false, proxyJobSeen = '', proxyFormLoaded = false;
+const PROXY_STATUS = {ready:['ok','可用'], unchecked:['mute','待检测'], failed:['bad','检测失败'], disabled:['mute','已停用'], cooling:['warn','出口冷却'], over_capacity:['warn','容量超限'], unbound:['warn','未绑定'], missing:['bad','代理已移除'], direct:['mute','原出口'], off:['mute','未启用']};
+function proxyStatus(status) {
+  const [cls, text] = PROXY_STATUS[status] || ['mute', status || '—'];
+  return '<span class="tag ' + cls + '">' + esc(text) + '</span>';
+}
+function proxyCapacity() {
+  const n = Number($('pxImportCapacity').value);
+  if (!Number.isInteger(n) || n < 1 || n > 10000) throw new Error('每 IP 账号数必须为 1–10000 的整数');
+  return n;
+}
+function renderProxies(data, quiet) {
+  proxiesData = data;
+  const settings = data.settings || {};
+  if (!proxyFormLoaded || !quiet) {
+    $('pxEnabled').checked = !!settings.enabled;
+    $('pxAutoAssign').checked = !!settings.auto_assign;
+    $('pxDirectUnbound').checked = !!settings.allow_direct_unbound;
+    $('pxDefaultCapacity').value = settings.default_capacity || 1;
+    if (!proxyFormLoaded) $('pxImportCapacity').value = settings.default_capacity || 1;
+    proxyFormLoaded = true;
+  }
+  const job = data.job, running = job && job.status === 'running';
+  $('pxSummary').textContent = (data.proxies || []).length + ' 条链接 · ' + (data.unique_ips || 0) + ' 个出口 IP · ' + (data.bound || 0) + ' 个账号已绑定';
+  for (const id of ['pxImport','pxGenerate','pxCheckAll','pxAssign','pxRedistribute']) $(id).disabled = !!running;
+  $('pxJobBox').hidden = !job;
+  if (job) {
+    $('pxJobStatus').textContent = running ? '检测中' : job.status === 'cancelled' ? '已取消' : job.status === 'failed' ? '操作失败' : '检测完成';
+    $('pxJobCounts').textContent = job.done + ' / ' + job.total + ' · 成功 ' + job.ok + ' · 失败 ' + job.failed + (job.assignment ? ' · 新分配 ' + job.assignment.assigned + ' · 未分配 ' + job.assignment.unbound.length : '');
+    $('pxJobErrors').textContent = (job.errors || []).join('\n');
+    if (!running && proxyJobSeen !== job.id) {
+      proxyJobSeen = job.id;
+      loadOverview(true);
+    }
+  }
+  $('pxBody').innerHTML = (data.proxies || []).map(p => '<tr data-proxy-id="' + esc(p.id) + '">' +
+    '<td class="who"><input data-px-name value="' + esc(p.name) + '" maxlength="80" aria-label="代理名称"><div class="id" title="' + esc(p.masked_url) + '">' + esc(p.masked_url) + '</div></td>' +
+    '<td class="num">' + esc(p.exit_ip || '—') + (p.latency_ms ? '<div class="hint">' + formatLatency(p.latency_ms) + '</div>' : '') + '</td>' +
+    '<td title="' + esc(p.message || '') + '">' + proxyStatus(p.status) + (p.message ? '<div class="hint">' + esc(p.message) + '</div>' : '') + '</td>' +
+    '<td class="num">' + (p.ip_bound || 0) + ' / <input type="number" data-px-cap min="1" max="10000" value="' + p.capacity + '" style="width:72px" aria-label="每 IP 账号容量"><div class="hint">此链接 ' + p.bound + ' 个账号</div></td>' +
+    '<td class="num">' + ago(p.checked_at) + '</td>' +
+    '<td><div class="btnrow"><label class="sel-note"><input data-px-enabled type="checkbox"' + (p.enabled ? ' checked' : '') + ' style="width:auto">启用</label><button class="xs" data-px-action="save" type="button">保存</button><button class="xs" data-px-action="check" type="button"' + (running ? ' disabled' : '') + '>检测</button><button class="xs danger" data-px-action="remove" type="button">移除</button></div></td></tr>').join('') || '<tr><td colspan="6"><div class="empty"><div class="big">还没有代理</div>粘贴你的代理链接，或从基础链接生成代理账号</div></td></tr>';
+  const realm = $('pxAssignRealm').value;
+  $('pxAccounts').innerHTML = (data.accounts || []).filter(a => !realm || a.realm === realm).map(a => {
+    const r = data.routes && data.routes[a.uid] || {};
+    const binding = r.binding || '';
+    const proxyOptions = (data.proxies || []).map(p => '<option value="' + esc(p.id) + '"' + (r.proxy_id === p.id ? ' selected' : '') + (p.status !== 'ready' && r.proxy_id !== p.id ? ' disabled' : '') + '>' + esc(p.name + ' · ' + (p.exit_ip || '未检测') + ' · ' + p.ip_bound + '/' + p.capacity) + '</option>').join('');
+    return '<tr><td class="who"><div class="nm">' + esc(a.nickname || a.uid.slice(0,12)) + ' <span class="realm-tag">' + (a.realm === 'global' ? '国际版' : '国内版') + '</span></div><div class="id">' + esc(a.uid) + '</div></td>' +
+      '<td>' + esc(r.direct ? '原出口' : r.exit_ip || '—') + ' ' + proxyStatus(r.status) + (r.message ? '<div class="hint">' + esc(r.message) + '</div>' : '') + '</td>' +
+      '<td><select data-px-account="' + esc(a.uid) + '" aria-label="账号固定出口"><option value=""' + (!binding ? ' selected' : '') + '>等待自动分配</option><option value="direct"' + (binding === 'direct' ? ' selected' : '') + '>使用原出口</option>' + proxyOptions + '</select></td></tr>';
+  }).join('') || '<tr><td colspan="3" class="empty">所选区域还没有账号</td></tr>';
+}
+async function loadProxies(quiet = false) {
+  if (proxyFetching) return;
+  proxyFetching = true;
+  try {
+    const d = await api('proxies', {timeoutMs:15000});
+    // Periodic refresh must not replace a row whose input is being edited.
+    const editing = $('view-proxies').contains(document.activeElement) && document.activeElement.matches('input,select,textarea');
+    if (quiet && editing) {
+      proxiesData = d;
+      const job = d.job;
+      if (job) { $('pxJobBox').hidden = false; $('pxJobStatus').textContent = job.status === 'running' ? '检测中' : '检测完成'; $('pxJobCounts').textContent = job.done + ' / ' + job.total + ' · 成功 ' + job.ok + ' · 失败 ' + job.failed; $('pxJobErrors').textContent = (job.errors || []).join('\n'); }
+    } else renderProxies(d, quiet);
+  } catch (e) { if (!quiet) toast('读取代理池失败：' + e.message, 'err'); }
+  finally { proxyFetching = false; }
+}
+async function proxyAction(button, run) {
+  button.disabled = true;
+  try { await run(); await loadProxies(true); }
+  catch (e) { toast(e.message, 'err'); }
+  finally { if (!(proxiesData && proxiesData.job && proxiesData.job.status === 'running')) button.disabled = false; }
+}
+$('pxReload').onclick = () => loadProxies(false);
+$('pxAssignRealm').onchange = () => { if (proxiesData) renderProxies(proxiesData, true); };
+$('pxSettingsForm').onsubmit = ev => {
+  ev.preventDefault();
+  proxyAction($('pxSaveSettings'), async () => {
+    await api('proxies/settings', {method:'POST', body:JSON.stringify({enabled:$('pxEnabled').checked, auto_assign:$('pxAutoAssign').checked, allow_direct_unbound:$('pxDirectUnbound').checked, default_capacity:Number($('pxDefaultCapacity').value)})});
+    toast('代理设置已保存，立即生效', 'ok'); await loadOverview(true);
+  });
+};
+async function importProxies(generate) {
+  $('pxImportError').hidden = true;
+  const button = $(generate ? 'pxGenerate' : 'pxImport');
+  await proxyAction(button, async () => {
+    const d = await api(generate ? 'proxies/generate' : 'proxies/import', {method:'POST', timeoutMs:15000, body:JSON.stringify({text:$('pxImportText').value, protocol:$('pxProtocol').value, base:$('pxBase').value, count:Number($('pxGenerateCount').value), prefix:$('pxAccountPrefix').value.trim(), capacity:proxyCapacity(), assign:$('pxImportAssign').checked, realm:$('pxAssignRealm').value})});
+    if (generate) $('pxBase').value = ''; else $('pxImportText').value = '';
+    if (d.errors && d.errors.length) { $('pxImportError').textContent = d.errors.join('\n'); $('pxImportError').hidden = false; }
+    toast('已保存 ' + d.imported + ' 条代理，后台检测出口 IP' + (d.duplicates ? '；重复 ' + d.duplicates + ' 条' : ''), 'ok');
+  });
+}
+$('pxImport').onclick = () => importProxies(false);
+$('pxGenerate').onclick = () => importProxies(true);
+$('pxCheckAll').onclick = () => proxyAction($('pxCheckAll'), () => api('proxies/check', {method:'POST', body:'{}'}));
+async function assignProxies(replace) {
+  if (replace && !confirm('重新分配会更改所选区域的现有固定出口。继续重新分配？')) return;
+  await proxyAction($(replace ? 'pxRedistribute' : 'pxAssign'), async () => {
+    const d = await api('proxies/assign', {method:'POST', body:JSON.stringify({realm:$('pxAssignRealm').value, replace})});
+    toast('新分配 ' + d.result.assigned + ' 个，保留 ' + d.result.kept + ' 个' + (d.result.unbound.length ? '，仍有 ' + d.result.unbound.length + ' 个无空位' : ''), d.result.unbound.length ? '' : 'ok');
+    await loadOverview(true);
+  });
+}
+$('pxAssign').onclick = () => assignProxies(false);
+$('pxRedistribute').onclick = () => assignProxies(true);
+$('pxBody').onclick = ev => {
+  const button = ev.target.closest('[data-px-action]'); if (!button) return;
+  const row = button.closest('[data-proxy-id]'), id = row.dataset.proxyId, action = button.dataset.pxAction;
+  proxyAction(button, async () => {
+    if (action === 'save') { await api('proxies/' + encodeURIComponent(id) + '/update', {method:'POST', body:JSON.stringify({name:row.querySelector('[data-px-name]').value, capacity:Number(row.querySelector('[data-px-cap]').value), enabled:row.querySelector('[data-px-enabled]').checked})}); toast('代理已保存', 'ok'); }
+    else if (action === 'check') await api('proxies/check', {method:'POST', body:JSON.stringify({ids:[id]})});
+    else if (action === 'remove') { if (!confirm('移除这个代理链接？已绑定账号的代理需先解除绑定。')) return; await api('proxies/' + encodeURIComponent(id) + '/remove', {method:'POST', body:'{}'}); }
+    await loadOverview(true);
+  });
+};
+$('pxAccounts').onchange = async ev => {
+  const select = ev.target.closest('[data-px-account]'); if (!select) return;
+  select.disabled = true;
+  try { await api('accounts/' + encodeURIComponent(select.dataset.pxAccount) + '/proxy', {method:'POST', body:JSON.stringify({proxy_id:select.value})}); toast('账号出口绑定已保存', 'ok'); await loadProxies(false); await loadOverview(true); }
+  catch(e) { toast(e.message, 'err'); await loadProxies(false); }
+  finally { select.disabled = false; }
+};
 $('btnExportAll').onclick = async () => {
   const b = $('btnExportAll'); b.disabled = true;
   try { await downloadCredentials('accounts/export', 'workbuddy-accounts.json'); }

@@ -542,6 +542,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .exp-nm { min-width: 0; overflow-wrap: anywhere; }
 .exp-main { line-height: 1.8; }
 .grid2, .grid3 { gap: 18px; }
+.btnrow { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.btnrow .grow { flex:1; }
+#view-proxies .who { min-width:190px; max-width:360px; }
+#view-proxies .id { overflow-wrap:anywhere; white-space:normal; }
+#view-proxies .hint { font-size:12px; }
+#view-proxies input[data-px-name] { max-width:250px; }
+#view-proxies h4 { font-size:13.5px; font-weight:600; }
 .switch { gap: 12px; flex-wrap: wrap; }
 .switch .hint { flex: 1 1 230px; line-height: 1.65; }
 .savebar { padding: 14px 20px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); gap: 12px; }
@@ -646,6 +653,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
+      <li><a href="#proxies" data-view="proxies">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="3" r="2"/><circle cx="3" cy="12" r="2"/><circle cx="13" cy="12" r="2"/><path d="M8 5v3M3 10V8h10v2"/></svg>
+        出口代理</a></li>
       <li><a href="#config" data-view="config">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
@@ -1195,6 +1205,57 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button type="submit" class="primary" id="btnCfgSave">保存配置</button>
         </div>
       </form>
+    </section>
+
+    <!-- 出口代理 -->
+    <section class="view" id="view-proxies" hidden>
+      <div class="box">
+        <header><h3>代理池与固定出口</h3><span class="grow"></span><span class="note" id="pxSummary">加载中</span><button class="xs" id="pxReload" type="button">刷新列表</button></header>
+        <form class="pad" id="pxSettingsForm">
+          <div class="grid2">
+            <label class="switch"><span class="lb">启用账号代理</span><input id="pxEnabled" type="checkbox"><span class="hint">保存后立即生效</span></label>
+            <label class="switch"><span class="lb">新账号自动分配</span><input id="pxAutoAssign" type="checkbox" checked><span class="hint">使用检测成功且有空位的出口</span></label>
+            <label class="fld"><span class="lb">每个 IP 默认绑定账号数</span><input id="pxDefaultCapacity" type="number" min="1" max="10000" value="1"><span class="hint">默认 1；相同实际出口 IP 共用容量</span></label>
+            <label class="switch"><span class="lb">未绑定账号使用原出口</span><input id="pxDirectUnbound" type="checkbox"><span class="hint">关闭时，未绑定账号等待分配；已绑定代理失败不改为直连</span></label>
+          </div>
+          <div class="btnrow" style="margin-top:12px"><span class="grow"></span><button class="primary" id="pxSaveSettings" type="submit">保存设置</button></div>
+        </form>
+      </div>
+      <div class="box">
+        <header><h3>添加代理</h3><span class="grow"></span><span class="note">HTTP(S) · SOCKS5 / SOCKS5h</span></header>
+        <div class="pad">
+          <div class="grid2">
+            <label class="fld"><span class="lb">无协议链接按此类型导入</span><select id="pxProtocol"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5h">SOCKS5h（代理端 DNS）</option><option value="socks5">SOCKS5</option></select></label>
+            <label class="fld"><span class="lb">本批每个 IP 绑定账号数</span><input id="pxImportCapacity" type="number" min="1" max="10000" value="1"></label>
+          </div>
+          <label class="fld" style="margin-top:12px"><span class="lb">粘贴完整代理列表</span><textarea id="pxImportText" rows="5" spellcheck="false" autocomplete="off" placeholder="socks5h://分组.代理账号:密码@主机:端口&#10;http://用户名:密码@主机:端口&#10;主机:端口:用户名:密码"></textarea><span class="hint">支持一行一条、用户名:密码@主机:端口、主机:端口:用户名:密码、用户名:密码:主机:端口、竖线／逗号分隔与 JSON。原有用户名和密码保留；顺序不明确时会提示使用完整 URL。</span></label>
+          <label class="sel-note" style="margin-top:10px"><input id="pxImportAssign" type="checkbox" checked style="width:auto">检测完成后分配未绑定账号</label>
+          <div class="btnrow" style="margin-top:10px"><button class="primary" id="pxImport" type="button">导入并检测出口</button><span class="hint">检测在后台执行，页面可随时关闭；已有绑定保留</span></div>
+          <div class="hr"></div>
+          <h4 style="margin-bottom:10px">从基础链接生成代理账号</h4>
+          <label class="fld"><span class="lb">基础链接或账号模板</span><input id="pxBase" spellcheck="false" autocomplete="off" placeholder="socks5h://国家或分组:密码@主机:端口"><span class="hint">国家／分组完全使用你的输入，例如 sg、us 或自定义值。基础用户名后附加 .代理账号；也可用 {account} 指定位置，例如 socks5h://分组.{account}:密码@主机:端口。</span></label>
+          <div class="grid2" style="margin-top:10px">
+            <label class="fld"><span class="lb">生成代理账号数</span><input id="pxGenerateCount" type="number" min="1" max="500" value="10"></label>
+            <label class="fld"><span class="lb">代理账号名称前缀</span><input id="pxAccountPrefix" value="wb2a" maxlength="24" placeholder="自定义前缀"></label>
+          </div>
+          <div class="btnrow" style="margin-top:12px"><button id="pxGenerate" type="button">生成账号链接并检测</button></div>
+          <div class="err" id="pxImportError" hidden style="margin-top:10px;white-space:pre-wrap"></div>
+        </div>
+      </div>
+      <div class="box" id="pxJobBox" hidden>
+        <header><h3>出口检测进度</h3><span class="grow"></span><span class="note" id="pxJobStatus"></span></header>
+        <div class="pad"><div class="note" id="pxJobCounts"></div><pre class="hint" id="pxJobErrors" style="margin-top:8px;white-space:pre-wrap"></pre></div>
+      </div>
+      <div class="box">
+        <header><h3>出口列表</h3><span class="grow"></span><button class="xs" id="pxCheckAll" type="button">全部检测</button></header>
+        <div class="tbl-wrap"><table class="acc"><thead><tr><th>代理名称／地址</th><th>实际出口 IP</th><th>状态</th><th>IP 绑定数／容量</th><th>检测时间</th><th>操作</th></tr></thead><tbody id="pxBody"></tbody></table></div>
+        <div class="pad hint">同一 IP 的多条链接共用容量。出口检测服务返回的 IP 用于分组；代理商若改变出口，可再次检测后查看和调整绑定。</div>
+      </div>
+      <div class="box">
+        <header><h3>分配 WorkBuddy 账号</h3><span class="grow"></span><select class="xs" id="pxAssignRealm" aria-label="账号区域"><option value="">全部账号</option><option value="global">国际账号</option><option value="cn">国内账号</option></select><button class="xs primary" id="pxAssign" type="button">一键分配未绑定账号</button><button class="xs" id="pxRedistribute" type="button">重新分配所选区域</button></header>
+        <div class="pad hint">按账号池顺序填补空位，绑定保存后跨重启不变。重新分配会更改现有绑定；也可以在下表逐个选择固定出口。</div>
+        <div class="tbl-wrap"><table class="acc"><thead><tr><th>WorkBuddy 账号</th><th>当前出口</th><th>代理绑定</th></tr></thead><tbody id="pxAccounts"></tbody></table></div>
+      </div>
     </section>
 
     <!-- 日志 -->

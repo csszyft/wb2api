@@ -602,6 +602,9 @@ func (p *Pool) modelRateLimitExhaustedLocked(model, realm string, now time.Time)
 		if e.disabled || e.manualDisabled {
 			continue // 禁用/临时停用号选号器一律不考虑：不是"模型被限流"
 		}
+		if e.outboundAvailable != nil && !e.outboundAvailable(e.a.UID) {
+			return 0, false // A proxy failure is a separate terminal condition.
+		}
 		cands++
 		until := e.modelRateLimitUntil(now, model)
 		if until.IsZero() {

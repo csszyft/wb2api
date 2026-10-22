@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/egress"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
@@ -1006,7 +1007,8 @@ type apiEnvelope struct {
 
 // Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
 type Client struct {
-	HTTP *http.Client
+	HTTP   *http.Client
+	Egress *egress.Manager
 
 	// ChatHTTP 聊天 SSE 专用 client：无总时长上限（Timeout=0），首字节由
 	// Transport.ResponseHeaderTimeout 约束，流中空闲由 IdleTimeout 约束。
@@ -1384,8 +1386,12 @@ func (c *Client) webBase(a *auth.Auth) string {
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+func (c *Client) doJSON(req *http.Request, account ...*auth.Auth) (json.RawMessage, error) {
+	var a *auth.Auth
+	if len(account) > 0 {
+		a = account[0]
+	}
+	resp, err := c.doAccount(req, a)
 	if err != nil {
 		return nil, err
 	}
@@ -1531,7 +1537,7 @@ func (c *Client) refreshTokenOnce(a *auth.Auth) error {
 	c.RefreshHeaders(req, &hdrSnapshot)
 
 	// 网络 I/O（锁外，30s 上限）。
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return err
 	}
@@ -1629,7 +1635,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
-		httpClient := c.chatHTTPFor(req.URL)
+		req = egress.WithAccount(req, a.UID)
+		routeKey := c.Egress.Route(a.UID).Key
+		httpClient := c.chatHTTPFor(req.URL, routeKey)
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			cancel()
@@ -1668,7 +1676,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
 		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
 		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
-		body := c.observeChatProtocol(resp.Body, reqCtx, req.URL, resp.ProtoMajor)
+		body := c.observeChatProtocol(resp.Body, reqCtx, req.URL, resp.ProtoMajor, routeKey)
 		return monitorBody(body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 	}
 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
@@ -1891,7 +1899,7 @@ func (c *Client) fetchModelsOnce(ctx context.Context, a *auth.Auth, path string)
 	// 设备指纹头（CommonHeaders 被 refresh 共用，故注入不放在那里，见 headers.go）。
 	c.injectAccountStableHeaders(req, a)
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.doAccount(req, a)
 	if err != nil {
 		return nil, diag, err
 	}
@@ -2182,7 +2190,7 @@ func (c *Client) fetchV3ConfigModelMapContext(ctx context.Context, a *auth.Auth,
 	}
 	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.doAccount(req, a)
 	if err != nil {
 		return nil, err
 	}

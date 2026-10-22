@@ -77,7 +77,7 @@ func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any, mp bo
 	if mp {
 		req.Header.Set(mpPlatformHeader, mpPlatformValue)
 	}
-	return c.doJSON(req)
+	return c.doJSON(req, a)
 }
 
 // TravelStatus 查询猫猫旅行状态。

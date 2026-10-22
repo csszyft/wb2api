@@ -358,7 +358,7 @@ func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]ModelInfo, error
 	// global 模型目录探测同 FetchModels：账号级业务路径，注入设备指纹头同口径。
 	c.injectAccountStableHeaders(req, a)
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.doAccount(req, a)
 	if err != nil {
 		return nil, err
 	}

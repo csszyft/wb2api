@@ -13,7 +13,7 @@ docker compose pull
 docker compose up -d
 ```
 
-仓库中的 [docker-compose.yml](docker-compose.yml) 使用已构建的 `ghcr.io/csszyft/wb2api:latest`，**无需本地编译，也无需先复制 config.example.json**。需要固定版本时，将 Compose 的 `image` 改为 `ghcr.io/csszyft/wb2api:v1.9.44`。
+仓库中的 [docker-compose.yml](docker-compose.yml) 使用已构建的 `ghcr.io/csszyft/wb2api:latest`，**无需本地编译，也无需先复制 config.example.json**。需要固定版本时，将 Compose 的 `image` 改为 `ghcr.io/csszyft/wb2api:v1.9.45`。
 
 首次启动会在宿主机 `./data/config.json` 生成配置和随机 `api_key`。打开该文件查看密钥，然后访问：
 
@@ -44,7 +44,7 @@ docker run -d --name wb2api \
   -e WB2A_AUTH_DIR=/app/data/auths \
   -e WB2A_STATE_FILE=/app/data/state.json \
   -v "$PWD/data:/app/data" \
-  ghcr.io/csszyft/wb2api:v1.9.44
+  ghcr.io/csszyft/wb2api:v1.9.45
 ```
 
 此方式与 Compose 使用相同的数据目录和端口。容器首次以 root 进入入口脚本修正数据卷权限，再降权为 UID `10001` 运行服务。
@@ -118,6 +118,30 @@ curl -sN http://127.0.0.1:7863/v1/chat/completions \
 
 非流式请求将 `stream` 改为 `false`。没有可用账号时，`/healthz` 可返回 `503`；这时先检查账号池，不能仅凭这个状态判断进程没有启动。
 
+## 代理池与账号固定出口
+
+`v1.9.45` 新增“出口代理”页面。支持 HTTP、HTTPS、SOCKS5 和 SOCKS5h，账号的聊天、刷新凭证、余额、模型查询及任务请求统一走绑定代理。SOCKS5h 由代理端解析目标域名。
+
+1. 打开“出口代理”，设置每个 IP 允许绑定的 WorkBuddy 账号数，默认 `1`。
+2. 粘贴代理链接，点击“导入并检测出口”。默认勾选“检测完成后分配未绑定账号”，已有绑定保持不变。
+3. 检测完成后，出口列表显示实际公网 IP、容量和已绑定账号数。两条链接若检测出同一个 IP，共用该 IP 的容量。
+4. 勾选“启用账号代理”并保存。新账号自动分配可单独开启；也可按国内／国际区域一键分配，或逐账号选定出口。
+
+完整链接示例（使用你自己的主机、端口、用户名和密码）：
+
+```text
+http://分组.代理账号:密码@主机:端口
+socks5h://分组.代理账号:密码@主机:端口
+```
+
+`sg`、`us` 等仅为代理商定义的国家或分组用户名，程序保留你的输入。“代理账号”指完整代理用户名中的固定出口标识，和 WorkBuddy 账号分别管理。从基础链接生成时，程序在用户名后附加 `.代理账号`；其他供应商格式可用 `{account}` 指定位置，例如 `socks5h://分组.{account}:密码@主机:端口`。生成结果保存后固定，重启不会重新生成。
+
+批量导入兼容 `用户名:密码@主机:端口`、`主机:端口:用户名:密码`、`用户名:密码:主机:端口`、竖线／逗号分隔及 JSON 的 `host/server`、`port/server_port`、`username/user`、`password/pass` 字段。没有协议的行使用页面选定的类型；无法确定字段顺序时提示改用完整 URL。特殊字符可用 URL 编码，如密码中的 `@` 写为 `%40`。
+
+代理池未启用时使用原出口。启用后，默认未绑定账号等待分配；如需继续用原出口，可打开对应开关或逐账号明确选择。绑定代理失败会单独报告代理错误，避免将健康账号计为故障；WAF 多账号拦截按实际出口 IP 隔离。代理出口故障不作为免费额度耗尽，也不触发 SG／国内付费回退。
+
+代理与账号绑定保存在状态文件同目录的 `proxy-pool.json`，常见位置为 `data/proxy-pool.json`。该文件含代理认证信息，迁移时和现有数据目录一起保留。面板列表隐藏代理密码。程序检测出口 IP 后保存观测值，实际固定出口由代理商保证；代理商变更出口后可再次检测并调整绑定。
+
 ## 路由与额度设置
 
 配置页可编辑大部分运行参数，完整字段参考 [config.example.json](config.example.json)。以下为相关配置片段，合并进已有配置即可：
@@ -157,6 +181,7 @@ curl -sN http://127.0.0.1:7863/v1/chat/completions \
 | 用量 | 按账号、模型、区域和时间范围查看用量 |
 | 积分构成 | 积分包剩余量、到期批次与到期提醒 |
 | 模型与档位 | 分区模型目录、倍率、思考档位、上下文与输出上限 |
+| 出口代理 | 批量导入代理、检测公网 IP、生成代理账号、设置每 IP 容量与固定账号绑定 |
 | 任务中心 | 查看上游提供的成长任务与执行队列；活动与奖励以官方当期规则为准 |
 | 配置 | 在线保存配置；需要重启的字段会显示提示 |
 | 运行日志 | 请求记录、首字延迟、耗时、Token、错误结果，以及任务／系统日志 |

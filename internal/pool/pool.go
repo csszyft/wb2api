@@ -79,7 +79,10 @@ type Pool struct {
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
-	closeOnce sync.Once
+	closeOnce         sync.Once
+	accountChangeHook func([]*auth.Auth)
+	accountHookMu     sync.Mutex
+	outboundAvailable func(string) bool
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -277,16 +280,18 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
 func (p *Pool) Add(a *auth.Auth) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.upsertLocked(a)
+	p.mu.Unlock()
+	p.NotifyAccountChange()
 }
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.syncToDirLocked(auths, nil)
+	p.mu.Unlock()
+	p.NotifyAccountChange()
 }
 
 // SyncToDirExcept 同 SyncToDir，但 keep 集合内的 uid **不参与剔除**：即便本轮扫描
@@ -301,8 +306,10 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 // 返回 (新增 uid, 剔除 uid)，按 UID 升序，供调用方打运维日志。
 func (p *Pool) SyncToDirExcept(auths []*auth.Auth, keep map[string]bool) (added, removed []string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.syncToDirLocked(auths, keep)
+	added, removed = p.syncToDirLocked(auths, keep)
+	p.mu.Unlock()
+	p.NotifyAccountChange()
+	return added, removed
 }
 
 // syncToDirLocked 是 SyncToDir / SyncToDirExcept 的唯一对账实现（启动全量对齐与
@@ -338,14 +345,16 @@ func (p *Pool) syncToDirLocked(auths []*auth.Auth, keep map[string]bool) (added,
 // 在途请求的 Release 对已删条目是 no-op，无需等待。
 func (p *Pool) Remove(uid string) *auth.Auth {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
 	if !ok {
+		p.mu.Unlock()
 		return nil
 	}
 	delete(p.byUID, uid)
 	p.dirty.Store(true)
 	p.saveLocked()
+	p.mu.Unlock()
+	p.NotifyAccountChange()
 	return e.a
 }
 
@@ -354,9 +363,10 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 func (p *Pool) upsertLocked(a *auth.Auth) {
 	if e, ok := p.byUID[a.UID]; ok {
 		e.a = a // 保留 credits/cooling 状态
+		e.outboundAvailable = p.outboundAvailable
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a}
+	p.byUID[a.UID] = &entry{a: a, outboundAvailable: p.outboundAvailable}
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

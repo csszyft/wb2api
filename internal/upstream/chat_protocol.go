@@ -27,36 +27,43 @@ type chatProtocolFallback struct {
 
 func chatOrigin(u *url.URL) string { return u.Scheme + "://" + u.Host }
 
-func (c *Client) chatHTTPFor(u *url.URL) *http.Client {
+func (c *Client) chatHTTPFor(u *url.URL, route ...string) *http.Client {
 	base := c.chatHTTP()
 	f := &c.chatFallback
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	key := chatOrigin(u)
+	if len(route) > 0 {
+		key += "|" + route[0]
+	}
 	if !time.Now().Before(f.until[key]) {
 		delete(f.until, key)
 		return base
 	}
-	tr, ok := base.Transport.(*http.Transport)
-	if !ok {
-		return base // Preserve injected/custom transports.
-	}
 	if f.h1 == nil || f.base != base {
-		clone := tr.Clone()
-		clone.ForceAttemptHTTP2 = false
-		clone.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
-		if clone.TLSClientConfig != nil {
-			clone.TLSClientConfig = clone.TLSClientConfig.Clone()
-			clone.TLSClientConfig.NextProtos = []string{"http/1.1"}
+		var transport http.RoundTripper
+		if routed, ok := base.Transport.(interface{ HTTP1Transport() http.RoundTripper }); ok {
+			transport = routed.HTTP1Transport()
+		} else if tr, ok := base.Transport.(*http.Transport); ok {
+			clone := tr.Clone()
+			clone.ForceAttemptHTTP2 = false
+			clone.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+			if clone.TLSClientConfig != nil {
+				clone.TLSClientConfig = clone.TLSClientConfig.Clone()
+				clone.TLSClientConfig.NextProtos = []string{"http/1.1"}
+			}
+			transport = clone
+		} else {
+			return base
 		}
 		h1 := *base
-		h1.Transport = clone
+		h1.Transport = transport
 		f.base, f.h1 = base, &h1
 	}
 	return f.h1
 }
 
-func (c *Client) noteChatHTTP2Failure(u *url.URL) {
+func (c *Client) noteChatHTTP2Failure(u *url.URL, route ...string) {
 	f := &c.chatFallback
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -64,6 +71,9 @@ func (c *Client) noteChatHTTP2Failure(u *url.URL) {
 		f.until = make(map[string]time.Time)
 	}
 	key := chatOrigin(u)
+	if len(route) > 0 {
+		key += "|" + route[0]
+	}
 	wasActive := time.Now().Before(f.until[key])
 	f.until[key] = time.Now().Add(chatHTTP1Cooldown)
 	if !wasActive {
@@ -97,9 +107,9 @@ func isChatHTTP2Failure(err error) bool {
 		(strings.Contains(s, "INTERNAL_ERROR") || strings.Contains(s, "PROTOCOL_ERROR"))
 }
 
-func (c *Client) observeChatProtocol(body io.ReadCloser, ctx context.Context, u *url.URL, major int) io.ReadCloser {
+func (c *Client) observeChatProtocol(body io.ReadCloser, ctx context.Context, u *url.URL, major int, route ...string) io.ReadCloser {
 	if major != 2 {
 		return body
 	}
-	return &chatProtocolBody{ReadCloser: body, ctx: ctx, onFail: func() { c.noteChatHTTP2Failure(u) }}
+	return &chatProtocolBody{ReadCloser: body, ctx: ctx, onFail: func() { c.noteChatHTTP2Failure(u, route...) }}
 }

@@ -29,6 +29,9 @@ func (p *Pool) deepseekSGExhaustedLocked(now time.Time) bool {
 		if e.disabled || e.manualDisabled || e.a.Realm() != "global" {
 			continue
 		}
+		if e.outboundAvailable != nil && !e.outboundAvailable(e.a.UID) {
+			return false // Do not escalate to paid CN while the fixed exit is down.
+		}
 		n++
 		mc := e.modelCooldowns[DeepseekPaidModel]
 		quotaRateLimited := !e.modelRateLimitUntil(now, DeepseekPaidModel).IsZero() && !isModelBusyReason(mc.Reason)

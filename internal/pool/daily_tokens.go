@@ -216,6 +216,9 @@ func (p *Pool) deepseekFreeExhaustedLocked(now time.Time) bool {
 		if e.disabled || e.manualDisabled || e.a.Realm() != "global" {
 			continue
 		}
+		if e.outboundAvailable != nil && !e.outboundAvailable(e.a.UID) {
+			return false // An unavailable fixed exit is not free-quota exhaustion.
+		}
 		n++
 		mc := e.modelCooldowns[DeepseekFreeModel]
 		quotaRateLimited := !e.modelRateLimitUntil(now, DeepseekFreeModel).IsZero() && !isModelBusyReason(mc.Reason)

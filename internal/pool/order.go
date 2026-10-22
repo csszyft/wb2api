@@ -18,9 +18,9 @@ import "sort"
 // account_order，不塞进每个 account 对象）。
 func (p *Pool) SetOrder(uids []string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if len(uids) == 0 {
 		if len(p.order) == 0 {
+			p.mu.Unlock()
 			return // 已是「无自定义顺序」：不产生无意义的落盘
 		}
 		p.order = nil // 空数组 = 清除自定义顺序 → 回落「按 UID 排序」（改动前行为）
@@ -29,6 +29,8 @@ func (p *Pool) SetOrder(uids []string) {
 	}
 	p.dirty.Store(true)
 	p.saveLocked()
+	p.mu.Unlock()
+	p.NotifyAccountChange()
 }
 
 // Order 返回**有效顺序**（与 List() 和 sequential 选号同一口径）：
