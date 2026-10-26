@@ -1034,7 +1034,11 @@ type Client struct {
 
 	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
-	globalModels fetchGlobalModelsCache
+	globalModels   fetchGlobalModelsCache
+	catalogFlights catalogFlightGroup
+
+	modelsCacheMu sync.Mutex
+	modelsCache   map[string]modelsCacheEntry
 
 	modelCatalogMu sync.RWMutex
 	modelCatalog   map[string]map[string]bool
@@ -1814,7 +1818,7 @@ type ModelFetchAgent struct {
 // 模型目录决定「能调哪些模型」；IDE /v3/config 覆盖同名模型的窗口 / 思考档
 // （覆盖用 c.chatBase(a)，因此同样 realm 感知；失败则静默保留目录字段）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
-	out, _, err := c.FetchModelsDiag(a)
+	out, _, err := c.fetchModelsDiagContext(context.Background(), a, false)
 	return out, err
 }
 
@@ -1828,6 +1832,57 @@ const modelRequestTimeout = 4 * time.Second
 // FetchModelsDiagContext bounds the complete catalog lookup, including endpoint
 // fallbacks and optional capability probes. Cancellation reaches HTTP reads.
 func (c *Client) FetchModelsDiagContext(ctx context.Context, a *auth.Auth) ([]ModelInfo, ModelFetchDiag, error) {
+	return c.fetchModelsDiagContext(ctx, a, true)
+}
+
+func (c *Client) fetchModelsDiagContext(ctx context.Context, a *auth.Auth, allowCache bool) ([]ModelInfo, ModelFetchDiag, error) {
+	if a == nil {
+		return nil, ModelFetchDiag{}, fmt.Errorf("models account is nil")
+	}
+	realm := realmKey(a.Realm())
+	c.modelsCacheMu.Lock()
+	entry, ok := c.modelsCache[realm]
+	c.modelsCacheMu.Unlock()
+	if allowCache && ok && entry.err == nil && time.Since(entry.fetched) < modelCatalogCacheTTL {
+		return cloneModelInfos(entry.infos), cloneModelDiag(entry.diag), nil
+	}
+	completed := c.catalogFlights.do(ctx, "models:"+realm, func(workerCtx context.Context) {
+		infos, diag, err := c.fetchModelsDiagUncached(workerCtx, a)
+		c.modelsCacheMu.Lock()
+		if c.modelsCache == nil {
+			c.modelsCache = make(map[string]modelsCacheEntry)
+		}
+		c.modelsCache[realm] = modelsCacheEntry{infos: cloneModelInfos(infos), diag: cloneModelDiag(diag), err: err, fetched: time.Now()}
+		c.modelsCacheMu.Unlock()
+	})
+	c.modelsCacheMu.Lock()
+	entry, ok = c.modelsCache[realm]
+	c.modelsCacheMu.Unlock()
+	if ok && (completed || entry.err == nil) {
+		return cloneModelInfos(entry.infos), cloneModelDiag(entry.diag), entry.err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, ModelFetchDiag{}, err
+	}
+	return nil, ModelFetchDiag{}, fmt.Errorf("model catalog unavailable")
+}
+
+// RefreshModelsDiagContext bypasses the short catalog cache for an explicit
+// user refresh. Ordinary callers use FetchModelsDiagContext and share probes.
+func (c *Client) RefreshModelsDiagContext(ctx context.Context, a *auth.Auth) ([]ModelInfo, ModelFetchDiag, error) {
+	return c.fetchModelsDiagContext(ctx, a, false)
+}
+
+const modelCatalogCacheTTL = 30 * time.Second
+
+type modelsCacheEntry struct {
+	infos   []ModelInfo
+	diag    ModelFetchDiag
+	err     error
+	fetched time.Time
+}
+
+func (c *Client) fetchModelsDiagUncached(ctx context.Context, a *auth.Auth) ([]ModelInfo, ModelFetchDiag, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	var lastErr error
@@ -2195,7 +2250,10 @@ func (c *Client) fetchV3ConfigModelMapContext(ctx context.Context, a *auth.Auth,
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read v3/config body: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("v3/config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}

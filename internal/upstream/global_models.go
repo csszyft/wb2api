@@ -66,9 +66,11 @@ var GlobalModelNames = []string{
 // Mutex 内嵌，与 modelList 无并发读路径竞争（唯一读写点本文件内）。
 type fetchGlobalModelsCache struct {
 	sync.Mutex
-	models   []ModelInfo // 成功缓存：探测基底 ∪ 静态独有（已去重）；nil = 未探测
-	fetched  time.Time
-	lastFail time.Time
+	models     []ModelInfo // 成功缓存：探测基底 ∪ 静态独有（已去重）；nil = 未探测
+	fetched    time.Time
+	lastFail   time.Time
+	refreshing bool
+	failed     bool
 
 	// credits 倍率旁表（裸 id → 上游原文，如 "x0.79"）。**与 models 同生命周期**：
 	// 同一次探测一起落、一起清。只经 GlobalModelInfosSnapshot 透出，不进 models
@@ -125,25 +127,49 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 		return staticGlobalModelInfos()
 	}
 
+	c.catalogFlights.do(context.Background(), "global-models", func(ctx context.Context) {
+		c.refreshGlobalModelInfos(ctx, a)
+	})
 	c.globalModels.Lock()
-	if len(c.globalModels.models) > 0 && time.Since(c.globalModels.fetched) < globalModelsTTL {
-		out := c.globalModels.models
-		c.globalModels.Unlock()
+	out := cloneModelInfos(c.globalModels.models)
+	failed := c.globalModels.failed
+	c.globalModels.Unlock()
+	if len(out) > 0 && !failed {
 		return out
 	}
-	if !c.globalModels.lastFail.IsZero() && time.Since(c.globalModels.lastFail) < globalModelsFailCooldown {
-		// 负缓存冷却期内：避免反复打上游，直接按失败处理（回落静态）。
-		c.globalModels.Unlock()
-		return staticGlobalModelInfos()
-	}
-	c.globalModels.Unlock()
+	return staticGlobalModelInfos()
+}
 
-	probed, err := c.probeGlobalModels(a)
+func (c *Client) refreshGlobalModelInfos(ctx context.Context, a *auth.Auth) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	c.globalModels.Lock()
+	if len(c.globalModels.models) > 0 && time.Since(c.globalModels.fetched) < globalModelsTTL {
+		c.globalModels.Unlock()
+		return
+	}
+	if !c.globalModels.lastFail.IsZero() && time.Since(c.globalModels.lastFail) < globalModelsFailCooldown {
+		c.globalModels.Unlock()
+		return
+	}
+	if c.globalModels.refreshing {
+		c.globalModels.Unlock()
+		return
+	}
+	c.globalModels.refreshing = true
+	c.globalModels.Unlock()
+	defer func() {
+		c.globalModels.Lock()
+		c.globalModels.refreshing = false
+		c.globalModels.Unlock()
+	}()
+
+	probed, err := c.probeGlobalModelsContext(ctx, a)
 	// v3/config 双 UA 能力表（吸收上游 9dce68a）：既作**能力补全 / 独有 id 补充**源
 	// （企业端点成功时），也作**目录兜底**源（企业端点全失败时）——企业端点挂了不等于
 	// 「上游没模型」，v3/config 是同一批账号可用的另一条目录来源，此时回落静态名单会
 	// 让客户端在上游其实可用的情况下少看到模型。两路全失败才回落静态 + 负缓存。
-	v3Cap, v3OK := c.probeGlobalV3Capabilities(a)
+	v3Cap, v3OK := c.probeGlobalV3CapabilitiesContext(ctx, a)
 
 	if err != nil || len(probed) == 0 {
 		if v3OK {
@@ -151,7 +177,8 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 			// （不写负缓存——上游确实返回了可用目录，只是走了另一条端点）。
 			// 倍率从 v3 条目摘（v3 是这一档唯一的价格来源），理由见 detachCredits。
 			merged := mergeGlobalModelInfos(v3CatalogInfos(v3Cap))
-			return c.storeGlobalModels(merged, detachCredits(merged))
+			c.storeGlobalModels(merged, detachCredits(merged))
+			return
 		}
 		// 两路全失败：负缓存 + 回落静态名单。倍率旁表一并清空（宁可省略，不可留旧值：
 		// 留下上一轮倍率会让 /v1/stats 展示与当前目录脱节的过期数字）。
@@ -159,8 +186,9 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 		c.globalModels.lastFail = time.Now()
 		c.globalModels.models = nil
 		c.globalModels.credits = nil
+		c.globalModels.failed = true
 		c.globalModels.Unlock()
-		return staticGlobalModelInfos()
+		return
 	}
 
 	// 成功：探测结果为基底（纯动态），静态独有条目仅按 id 补齐（元数据留空）。
@@ -176,7 +204,7 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 	// 倍率旁表：从合并后的目录摘（企业端点的 credits 优先，v3 只补企业端点没给的 id）。
 	// 静态独有条目无倍率——它们上游没返回，倍率未知，不编造。
 	// 摘取动作收在 detachCredits（两条分支共用，见其注释）。
-	return c.storeGlobalModels(merged, detachCredits(merged))
+	c.storeGlobalModels(merged, detachCredits(merged))
 }
 
 // storeGlobalModels 落缓存并返回目录（成功路径的公共尾巴：写 models/credits/fetched、
@@ -188,6 +216,7 @@ func (c *Client) storeGlobalModels(merged []ModelInfo, credits map[string]string
 	c.globalModels.credits = credits
 	c.globalModels.fetched = time.Now()
 	c.globalModels.lastFail = time.Time{}
+	c.globalModels.failed = false
 	c.globalModels.Unlock()
 	return merged
 }
@@ -335,9 +364,13 @@ func mergeGlobalModelInfos(probed []ModelInfo) []ModelInfo {
 // probeGlobalModels 按候选路径序列发起一次探测，返回条目列表（未去重、已滤 disabled）。
 // 家族端点全部非 2xx（等幂探活）才返回错误。
 func (c *Client) probeGlobalModels(a *auth.Auth) ([]ModelInfo, error) {
+	return c.probeGlobalModelsContext(context.Background(), a)
+}
+
+func (c *Client) probeGlobalModelsContext(ctx context.Context, a *auth.Auth) ([]ModelInfo, error) {
 	var lastErr error
 	for _, path := range globalModelsProbePaths {
-		infos, err := c.globalModelsOnce(a, path)
+		infos, err := c.globalModelsOnceContext(ctx, a, path)
 		if err != nil {
 			lastErr = err
 			continue
@@ -349,8 +382,14 @@ func (c *Client) probeGlobalModels(a *auth.Auth) ([]ModelInfo, error) {
 
 // globalModelsOnce 单端点探测。2xx + 解析出非空名单 → (infos, nil)；否则 (nil, err)。
 func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]ModelInfo, error) {
+	return c.globalModelsOnceContext(context.Background(), a, path)
+}
+
+func (c *Client) globalModelsOnceContext(ctx context.Context, a *auth.Auth, path string) ([]ModelInfo, error) {
 	url := c.chatBase(a) + path // 按 realm 切 base：global 账号 → global base
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	ctx, cancel := context.WithTimeout(ctx, modelRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -21,6 +21,20 @@ func (p *Pool) HasRealm(realm string) bool {
 	return false
 }
 
+// HasSelectableRealm reports whether the realm has an account that may be
+// selected. Cooldowns do not affect this decision: temporary failures must not
+// make the public model catalog and the default route flap between realms.
+func (p *Pool) HasSelectableRealm(realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, e := range p.byUID {
+		if e.a.Realm() == realm && !e.disabled && !e.manualDisabled {
+			return true
+		}
+	}
+	return false
+}
+
 // AvailableUIDsForRealm 同 AvailableUIDs，但仅返回 Realm()==realm 的账号。
 // realm=="" 退化为 AvailableUIDs（现状语义）。排序口径同 AvailableUIDs
 // （sortByOrderLocked → Pool.Order()），域过滤保序。

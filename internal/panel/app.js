@@ -920,7 +920,8 @@ function prefixedModelID(realm, id) {
    选择器只渲染 realm_servable 为 true 的域（池内没账号的域不给按钮，点了必 503）。
    当前域记在 mdRealm；首次进入由后端回显决定（纯 CN 部署 → cn）。 */
 let mdRealm = null, mdLoadSeq = 0;
-let mdCache = null;
+let mdCache = null, mdCacheRealm = null;
+let mdUserSelectedRealm = false;
 let mdFilter = {q: '', cap: '', effort: '', promo: '', sort: 'default'};
 function mdRateValue(m) {
   const raw = (m.promo_credits != null && m.promo_credits !== '') ? m.promo_credits : m.credits;
@@ -994,7 +995,9 @@ function renderModelRealms(d) {
     b.onclick = () => {
       if (b.dataset.realm === mdRealm) return;
       mdRealm = b.dataset.realm;
+      mdUserSelectedRealm = true;
       mdCache = null;
+      mdCacheRealm = null;
       loadModels();
     };
   });
@@ -1003,17 +1006,37 @@ function renderModelRealms(d) {
     (realms.length > 1 ? '' : '（池内只有这一个域）');
 }
 
-async function loadModels(cached = false) {
+async function loadModels(cached = false, force = false) {
   const seq = ++mdLoadSeq;
   const tb = $('mdBody');
+  // A realm-button refresh keeps its explicit selection. Other fresh loads
+  // re-evaluate availability after account disable/enable operations.
+  if (cached !== true && !force) mdUserSelectedRealm = false;
+  const requestedRealm = mdUserSelectedRealm ? mdRealm : null;
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测数据是可选增强：拉取失败不影响模型列表本身
-    const q = mdRealm ? '?realm=' + mdRealm : '';
-    const [d, pr] = cached === true && mdCache ? mdCache : await Promise.all([api('models' + q, { timeoutMs: 20000 }), api('model_probes', { timeoutMs: 5000 }).catch(() => ({}))]);
+    const params = new URLSearchParams();
+    if (requestedRealm) params.set('realm', requestedRealm);
+    if (force) params.set('refresh', '1');
+    const q = params.size ? '?' + params.toString() : '';
+    const [d, pr] = cached === true && mdCache && mdCacheRealm === requestedRealm
+      ? mdCache
+      : await Promise.all([api('models' + q, { timeoutMs: 20000 }), api('model_probes', { timeoutMs: 5000 }).catch(() => ({}))]);
     if (seq !== mdLoadSeq) return;
+    if (d.realm_servable && !(d.realm_servable || {})[d.realm]) return;
+    if (requestedRealm && requestedRealm !== d.realm && !(d.realm_servable || {})[requestedRealm]) {
+      mdRealm = null;
+      mdCache = null;
+      mdCacheRealm = null;
+      loadModels();
+      return;
+    }
     mdCache = [d, pr];
-    mdRealm = d.realm || mdRealm || 'global'; // 后端回显为准（缺省域由池内可用域决定）
+    mdCacheRealm = requestedRealm;
+    // Only the rendering state tracks the returned realm; requestedRealm
+    // remains null for automatic selection, so it cannot become sticky.
+    mdRealm = d.realm || mdRealm || 'global';
     renderModelRealms(d);
     const list = mdSortList((d.models || []).filter(m => mdMatch(m)));
     if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
@@ -1071,7 +1094,7 @@ async function loadModels(cached = false) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
 }
-$('btnModels').onclick = () => loadModels();
+$('btnModels').onclick = () => loadModels(false, true);
 for (const [id, key] of [['mdSearch','q'], ['mdCap','cap'], ['mdEffort','effort'], ['mdPromo','promo'], ['mdSort','sort']]) {
   $(id).addEventListener(id === 'mdSearch' ? 'input' : 'change', () => { mdFilter[key] = $(id).value; if (mdCache) loadModels(true); });
 }

@@ -326,7 +326,7 @@ func NewHandler(cfg Config) *Handler {
 	}
 	var hasRealm func(string) bool
 	if cfg.Pool != nil {
-		hasRealm = cfg.Pool.HasRealm
+		hasRealm = cfg.Pool.HasSelectableRealm
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.router = RealmRouter{
@@ -676,8 +676,8 @@ func (h *Handler) modelList() []map[string]any {
 }
 
 // realmAvailable 报告该域是否参与对外模型列表与裸名默认域。
-// 判据是「池内有没有这个域的账号」（pool.HasRealm，不看健康度）：账号全在冷却时
-// 列表与默认域不应突然翻转。global 另受 GlobalEnabled 逃生门约束。
+// 判据是「池内有没有这个域的可选账号」（不看临时冷却）：账号全在冷却时列表与
+// 默认域不应突然翻转；禁用/停用账号不占位。global 另受 GlobalEnabled 逃生门约束。
 func (h *Handler) realmAvailable(realm string) bool {
 	if h.cfg.Pool == nil {
 		return false
@@ -685,7 +685,7 @@ func (h *Handler) realmAvailable(realm string) bool {
 	if realm == "global" && !h.cfg.GlobalEnabled {
 		return false
 	}
-	return h.cfg.Pool.HasRealm(realm)
+	return h.cfg.Pool.HasSelectableRealm(realm)
 }
 
 // fetchGlobalModelInfos 拉 global realm 模型目录（探测 ∪ 静态独有 id，1h 缓存 +

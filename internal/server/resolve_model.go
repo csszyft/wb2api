@@ -22,7 +22,8 @@ func splitRealmPrefix(model string) (realm, bare string, ok bool) {
 //
 // 规则：
 //  1. 显式 "cn:"/"global:" 前缀优先——老客户端配置里写死的带前缀模型名零改动。
-//  2. 裸名若只出现在一个域的目录中，直接归属该域。
+//  2. 裸名若只出现在一个域的目录中，直接归属该域（即使该域账号暂不可用，
+//     也不把已知国际版模型错发给 CN 上游）。
 //  3. 两域共有或归属未知时，按池内可用域与 Precedence 决定。
 //
 // 单域部署（例如只登国际版账号）下裸名直接落到该域；配合 strip_realm_prefix
@@ -33,7 +34,7 @@ type RealmRouter struct {
 	GlobalEnabled bool
 	// Precedence applies to shared/unknown models when both realms have accounts.
 	Precedence string
-	// HasRealm 池内该域是否有账号；nil 视为无账号（测试可只给 Precedence）。
+	// HasRealm reports whether a realm has a selectable (not disabled) account.
 	HasRealm func(realm string) bool
 	// ModelRealms reads the shared catalog snapshots without network calls.
 	ModelRealms func(model string) (cn, global bool)

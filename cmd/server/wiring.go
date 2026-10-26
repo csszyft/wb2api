@@ -56,7 +56,7 @@ func (c *Config) realmRouter(p *pool.Pool) server.RealmRouter {
 		Precedence:    c.Models.RealmPrecedence,
 	}
 	if p != nil {
-		r.HasRealm = p.HasRealm
+		r.HasRealm = p.HasSelectableRealm
 	}
 	return r
 }

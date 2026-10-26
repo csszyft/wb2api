@@ -370,7 +370,7 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": rows, "limit": limit})
 }
 
-// models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
+// models 查询模型列表与 reasoning 档位（普通查询共享 30s 短缓存；refresh=1 强制重取）：
 // 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
 //
 // realm 感知：默认查「池内唯一可用域」（只登国际版账号的部署 → 查 global），可用
@@ -380,14 +380,21 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	realm := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("realm")))
 	if realm != "cn" && realm != "global" {
-		realm = p.defaultRealm() // 纯 CN 部署回落国内版，两域都可用时取 global
+		realm = p.defaultRealm() // 忽略已禁用/停用账号，两域都可查时取 global
 	} // 元数据路径（PickExcludingForRealmMeta）：本查询不消费积分，豁免保留积分闸门
 	// ——否则池内账号全部触底时面板「模型与档位」会 503，恰好是用户最需要看清
 	// "还剩什么免费模型"的时刻。理由见 internal/pool/reserve.go 文件头。
+	if p.cfg.Pool == nil {
+		writeErr(w, http.StatusServiceUnavailable, "账号池未配置")
+		return
+	}
 	acct := p.cfg.Pool.PickExcludingForRealmMeta(nil, realm)
 	if acct == nil {
-		writeErr(w, http.StatusServiceUnavailable,
-			"没有可用的 "+realm+" 账号：请先在面板添加账号再查询")
+		message := "没有可用的 " + realm + " 账号：请先添加或恢复账号再查询"
+		if !p.cfg.Pool.HasRealm(realm) {
+			message = "没有 " + realm + " 账号：请先在面板添加账号再查询"
+		}
+		writeErr(w, http.StatusServiceUnavailable, message)
 		return
 	}
 	// 国际站模型目录在 /v2 家族（/console 家族返回 500 网关错误页）——由
@@ -405,7 +412,11 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "上游客户端未配置")
 		return
 	}
-	infos, diag, err := p.cfg.Upstream.FetchModelsDiagContext(r.Context(), acct)
+	fetch := p.cfg.Upstream.FetchModelsDiagContext
+	if r.URL.Query().Get("refresh") == "1" {
+		fetch = p.cfg.Upstream.RefreshModelsDiagContext
+	}
+	infos, diag, err := fetch(r.Context(), acct)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "fetch models: "+err.Error())
 		return
@@ -503,10 +514,10 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 // realmServable 报告该域此刻是否可查（供前端决定显示哪几个 realm 选择器）。
 //
 // 判据与缺省域回退**同源**（这是刻意的：两处若各写一份，会出现"选择器显示 global、
-// 点了却 503"）：池内有没有该域的账号；global 另受逃生门（auth.GlobalEnabled）约束
+// 点了却 503"）：该域有没有未禁用/停用的账号；global 另受逃生门约束
 // ——关掉逃生门时 global 账号会被 Realm() 判回 cn，选择器不该还留一个必 503 的按钮。
 func (p *Panel) realmServable(realm string) bool {
-	if p.cfg.Pool == nil || !p.cfg.Pool.HasRealm(realm) {
+	if p.cfg.Pool == nil || !p.cfg.Pool.HasSelectableRealm(realm) {
 		return false
 	}
 	if realm == "global" {
@@ -515,11 +526,15 @@ func (p *Panel) realmServable(realm string) bool {
 	return true
 }
 
-// defaultRealm 缺省查询域：两域都可用时取 global（既有语义），只有 CN 时取 cn。
+// defaultRealm 缺省查询域：忽略禁用/停用账号；两域可查时取 global，只有 CN 时取 cn。
 // 与 models handler 的内联回退等价，抽出来是为了让 realm_servable 的判据能复用
 // 同一份知识（见 realmServable）。
 func (p *Panel) defaultRealm() string {
-	if p.cfg.Pool.HasRealm("cn") && !p.cfg.Pool.HasRealm("global") {
+	if p.cfg.Pool == nil {
+		return "global"
+	}
+	cn, global := p.realmServable("cn"), p.realmServable("global")
+	if cn && !global {
 		return "cn"
 	}
 	return "global"
